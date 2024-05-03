@@ -1,9 +1,11 @@
-import * as cheerio from "cheerio";
-import { ScrapingBeeClient } from "scrapingbee";
-import { attemptScrapWithRequests, sanitizeText } from "./utils/utils";
-import { extractMetadata } from "./utils/metadata";
-import dotenv from "dotenv";
-import { Document } from "../../entities/Document";
+import * as cheerio from 'cheerio';
+import { ScrapingBeeClient } from 'scrapingbee';
+import { attemptScrapWithRequests, sanitizeText } from './utils/utils';
+import { excludeNonMainTags } from './utils/excludeTags';
+import { extractMetadata } from './utils/metadata';
+import dotenv from 'dotenv';
+import { Document, PageOptions } from '../../lib/entities';
+import { parseMarkdown } from '../../lib/html-to-markdown';
 dotenv.config();
 
 async function scrapWithScrapingBee(url: string): Promise<string | null> {
@@ -12,7 +14,7 @@ async function scrapWithScrapingBee(url: string): Promise<string | null> {
     const response = await client.get({
       url: url,
       params: { timeout: 15000 },
-      headers: { "ScrapingService-Request": "TRUE" },
+      headers: { 'ScrapingService-Request': 'TRUE' },
     });
 
     if (response.status !== 200 && response.status !== 404) {
@@ -30,75 +32,122 @@ async function scrapWithScrapingBee(url: string): Promise<string | null> {
   }
 }
 
-export async function scrapSingleUrl(urlToScrap: string, toMarkdown: boolean = true): Promise<Document> {
+export async function scrapWithCustomFirecrawl(
+  url: string,
+  options?: any
+): Promise<string> {
+  try {
+    // TODO: merge the custom firecrawl scraper into mono-repo when ready
+    return null;
+  } catch (error) {
+    console.error(`Error scraping with custom firecrawl-scraper: ${error}`);
+    return '';
+  }
+}
+
+export async function scrapSingleUrl(
+  urlToScrap: string,
+  toMarkdown: boolean = true,
+  pageOptions: PageOptions = { onlyMainContent: true }
+): Promise<Document> {
   urlToScrap = urlToScrap.trim();
 
+  const removeUnwantedElements = (html: string, pageOptions: PageOptions) => {
+    const soup = cheerio.load(html);
+    soup('script, style, iframe, noscript, meta, head').remove();
+    if (pageOptions.onlyMainContent) {
+      // remove any other tags that are not in the main content
+      excludeNonMainTags.forEach((tag) => {
+        soup(tag).remove();
+      });
+    }
+    return soup.html();
+  };
+
+  const attemptScraping = async (
+    url: string,
+    method:
+      | 'firecrawl-scraper'
+      | 'scrapingBee'
+      | 'playwright'
+      | 'scrapingBeeLoad'
+      | 'fetch'
+  ) => {
+    let text = '';
+    switch (method) {
+      case 'firecrawl-scraper':
+        text = await scrapWithCustomFirecrawl(url);
+        break;
+      case 'fetch':
+        try {
+          const response = await fetch(url);
+          if (!response.ok) {
+            console.error(
+              `Error fetching URL: ${url} with status: ${response.status}`
+            );
+            return '';
+          }
+          text = await response.text();
+        } catch (error) {
+          console.error(`Error scraping URL: ${error}`);
+          return '';
+        }
+        break;
+    }
+
+    //* TODO: add an optional to return markdown or structured/extracted content
+    const cleanedHtml = removeUnwantedElements(text, pageOptions);
+
+    return [await parseMarkdown(cleanedHtml), text];
+  };
+
   try {
-    let content = await scrapWithScrapingBee(urlToScrap);
+    // TODO: comment this out once we're ready to merge firecrawl-scraper into the mono-repo
+    // let [text, html] = await attemptScraping(urlToScrap, 'firecrawl-scraper');
+    // if (!text || text.length < 100) {
+    //   console.log("Falling back to scraping bee load");
+    //   [text, html] = await attemptScraping(urlToScrap, 'scrapingBeeLoad');
+    // }
 
-    if (!content) {
-      const res = await attemptScrapWithRequests(urlToScrap);
-      if (!res) {
-        return null;
-      }
-      content = res;
-    }
-    var TurndownService = require('turndown')
-
-    const turndownService = new TurndownService();
-    let markdownContent = '';
-    if (toMarkdown) {
-      markdownContent = turndownService.turndown(content);
-    }
-
-
-    const soup2 = cheerio.load(content);
-    const metadata = extractMetadata(soup2, urlToScrap);
-    const soup = cheerio.load(markdownContent);
-
-
-    soup("script, style, iframe, noscript").remove();
-    let formattedText = '';
-    soup('body').children().each(function() {
-      const tagName = this.tagName.toLowerCase();
-      if (["p", "br", "h1", "h2", "h3", "h4", "h5", "h6"].includes(tagName)) {
-        formattedText += `${soup(this).text()}\n`;
-      } else if (tagName === 'pre' || tagName === 'code' || tagName === 'span') {
-        formattedText += `${soup(this).text()}`;
-      } else {
-        let text = soup(this).text();
-        text = text.split('\n').map(line => line.replace(/\s+/g, ' ').trim()).join('\n').replace(/\n{3,}/g, '\n\n');
-        formattedText += `${text} `;
-      }
-    });
-
-    const text = sanitizeText(formattedText.trim());
-
-    if (metadata) {
-      console.log(markdownContent)
-      console.log("here", toMarkdown)
+    let [text, html] = await attemptScraping(urlToScrap, 'scrapingBee');
+    // Basically means that it is using /search endpoint
+    if (pageOptions.fallback === false) {
+      const soup = cheerio.load(html);
+      const metadata = extractMetadata(soup, urlToScrap);
       return {
+        url: urlToScrap,
         content: text,
-        provider: "web-scraper",
+        markdown: text,
         metadata: { ...metadata, sourceURL: urlToScrap },
       } as Document;
-    } else {
-      return {
-        content: text,
-        provider: "web-scraper",
-        metadata: { sourceURL: urlToScrap },
-      } as Document;
     }
+    if (!text || text.length < 100) {
+      console.log('Falling back to playwright');
+      [text, html] = await attemptScraping(urlToScrap, 'playwright');
+    }
+
+    if (!text || text.length < 100) {
+      console.log('Falling back to scraping bee load');
+      [text, html] = await attemptScraping(urlToScrap, 'scrapingBeeLoad');
+    }
+    if (!text || text.length < 100) {
+      console.log('Falling back to fetch');
+      [text, html] = await attemptScraping(urlToScrap, 'fetch');
+    }
+
+    const soup = cheerio.load(html);
+    const metadata = extractMetadata(soup, urlToScrap);
+
     return {
-      content: markdownContent,
-      provider: "web-scraper",
-      metadata: { sourceURL: urlToScrap },
+      content: text,
+      markdown: text,
+      metadata: { ...metadata, sourceURL: urlToScrap },
     } as Document;
   } catch (error) {
     console.error(`Error: ${error} - Failed to fetch URL: ${urlToScrap}`);
     return {
-      content: "",
-      provider: "web-scraper",
+      content: '',
+      markdown: '',
       metadata: { sourceURL: urlToScrap },
     } as Document;
   }
